@@ -1,14 +1,13 @@
 import './bootstrap';
 
-const dedupeWindowMs = 8000;
-const jobIntervalMs = 5000;
-const jobBatchSize = 3;
-const maxRetries = 5;
-const baseBackoffMs = 15000;
+import Alpine from 'alpinejs';
 
-const dbName = 'isbn-scans';
-const dbVersion = 1;
-const storeName = 'scans';
+window.Alpine = Alpine;
+
+Alpine.start();
+
+const dedupeWindowMs = 8000;
+const themeStorageKey = 'isbn-theme';
 
 const state = {
     scanning: false,
@@ -17,10 +16,8 @@ const state = {
     detector: null,
     lastSeenIsbn: new Map(),
     scansCache: [],
-    processingQueue: false,
     filter: 'all',
     search: '',
-    inFlightLookups: new Map(),
 };
 
 let beepContext;
@@ -30,9 +27,12 @@ const ui = {};
 document.addEventListener('DOMContentLoaded', () => {
     cacheDom();
     bindUi();
-    openDatabase().then(refreshHistory);
+    if (!ui.video || !ui.historyList) {
+        return;
+    }
+    initTheme();
+    refreshHistory();
     maybeInitDetector();
-    startJobLoop();
 });
 
 function cacheDom() {
@@ -49,6 +49,7 @@ function cacheDom() {
     ui.filterSelect = document.getElementById('filter-status');
     ui.searchInput = document.getElementById('search-term');
     ui.scannerOverlay = document.getElementById('scanner-overlay');
+    ui.themeToggle = document.getElementById('theme-toggle');
 }
 
 function bindUi() {
@@ -76,7 +77,60 @@ function bindUi() {
         renderHistory(state.scansCache);
     });
 
-    window.addEventListener('online', processQueue);
+    ui.themeToggle?.addEventListener('click', toggleTheme);
+
+    window.addEventListener('online', refreshHistory);
+}
+
+function initTheme() {
+    const saved = localStorage.getItem(themeStorageKey);
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const theme = saved || (prefersDark ? 'dark' : 'light');
+    applyTheme(theme);
+}
+
+function applyTheme(theme) {
+    const isDark = theme === 'dark';
+    document.documentElement.classList.toggle('dark', isDark);
+    if (ui.themeToggle) {
+        ui.themeToggle.textContent = isDark ? 'Light mode' : 'Dark mode';
+    }
+}
+
+function toggleTheme() {
+    const isDark = document.documentElement.classList.contains('dark');
+    const next = isDark ? 'light' : 'dark';
+    localStorage.setItem(themeStorageKey, next);
+    applyTheme(next);
+}
+
+function getCsrfToken() {
+    return document.querySelector('meta[name="csrf-token"]')?.content;
+}
+
+async function apiRequest(path, options = {}) {
+    const csrfToken = getCsrfToken();
+    const response = await fetch(path, {
+        headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            ...(csrfToken ? { 'X-CSRF-TOKEN': csrfToken } : {}),
+            ...(options.headers || {}),
+        },
+        credentials: 'same-origin',
+        ...options,
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || 'Request failed');
+    }
+
+    if (response.status === 204) {
+        return null;
+    }
+
+    return response.json();
 }
 
 async function maybeInitDetector() {
@@ -257,29 +311,33 @@ async function handleDetection(rawValue, scanSource) {
     }
     state.lastSeenIsbn.set(isbnKey, now);
 
-    const scan = {
-        id: crypto.randomUUID(),
-        isbn: isbnKey,
-        format: result.format || 'UNKNOWN',
-        rawBarcode: rawValue,
-        scanSource,
-        scannedAt: now,
-        status: result.status,
-        lastTriedAt: undefined,
-        tryCount: 0,
-        metadata: null,
-        notes: result.reason,
-    };
+    try {
+        const response = await createScanIntent(rawValue, scanSource);
+        if (response?.duplicate) {
+            setFeedback(`Duplicate ignored (${isbnKey})`, 'warning');
+            return;
+        }
+        await refreshHistory();
 
-    await upsertScan(scan);
-    await refreshHistory();
-
-    if (scan.status === 'PENDING_LOOKUP') {
-        feedbackSuccess(isbnKey);
-        processQueue();
-    } else {
-        setFeedback(result.reason || 'Stored invalid barcode', 'warning');
+        if (result.status === 'PENDING_LOOKUP') {
+            feedbackSuccess(isbnKey);
+        } else {
+            setFeedback(result.reason || 'Stored invalid barcode', 'warning');
+        }
+    } catch (error) {
+        console.error('Unable to save scan', error);
+        setFeedback('Unable to save scan. Check connection and retry.', 'error');
     }
+}
+
+async function createScanIntent(rawBarcode, scanSource) {
+    return apiRequest('/scan-intents', {
+        method: 'POST',
+        body: JSON.stringify({
+            raw_barcode: rawBarcode,
+            scan_source: scanSource,
+        }),
+    });
 }
 
 function feedbackSuccess(isbn) {
@@ -314,61 +372,15 @@ function setFeedback(message, level = 'info') {
     ui.feedback.dataset.level = level;
 }
 
-function openDatabase() {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(dbName, dbVersion);
-        request.onupgradeneeded = () => {
-            const db = request.result;
-            if (!db.objectStoreNames.contains(storeName)) {
-                const store = db.createObjectStore(storeName, { keyPath: 'id' });
-                store.createIndex('isbn', 'isbn', { unique: false });
-                store.createIndex('status', 'status', { unique: false });
-                store.createIndex('scannedAt', 'scannedAt', { unique: false });
-            }
-        };
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-    });
-}
-
-async function getDb() {
-    if (!state.dbPromise) {
-        state.dbPromise = openDatabase();
-    }
-    return state.dbPromise;
-}
-
-async function upsertScan(scan) {
-    const db = await getDb();
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(storeName, 'readwrite');
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
-        tx.objectStore(storeName).put(scan);
-    });
-}
-
-async function listScans() {
-    const db = await getDb();
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(storeName, 'readonly');
-        const scans = [];
-        tx.oncomplete = () => resolve(scans);
-        tx.onerror = () => reject(tx.error);
-        const cursor = tx.objectStore(storeName).index('scannedAt').openCursor(null, 'prev');
-        cursor.onsuccess = (event) => {
-            const row = event.target.result;
-            if (row) {
-                scans.push(row.value);
-                row.continue();
-            }
-        };
-    });
-}
-
 async function refreshHistory() {
-    state.scansCache = await listScans();
-    renderHistory(state.scansCache);
+    try {
+        const response = await apiRequest('/scan-intents');
+        state.scansCache = response?.data || [];
+        renderHistory(state.scansCache);
+    } catch (error) {
+        console.error('Unable to refresh history', error);
+        setFeedback('Unable to load scan history.', 'error');
+    }
 }
 
 function renderHistory(scans) {
@@ -389,21 +401,22 @@ function renderHistory(scans) {
     filtered.forEach((scan) => {
         const item = document.createElement('div');
         item.className =
-            'rounded-lg border border-slate-800 bg-slate-900/60 p-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between';
+            'rounded-lg border border-slate-200 bg-white/80 p-4 text-slate-900 shadow-sm dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-100 flex flex-col gap-2 md:flex-row md:items-center md:justify-between';
         item.innerHTML = `
             <div class="space-y-1">
                 <div class="flex items-center gap-2">
                     ${statusBadge(scan.status)}
                     <span class="font-mono text-lg">${scan.isbn}</span>
-                    <span class="text-xs text-slate-400">${scan.format || ''}</span>
+                    <span class="text-xs text-slate-500 dark:text-slate-400">${scan.format || ''}</span>
                 </div>
-                <div class="text-sm text-slate-300">
+                <div class="text-sm text-slate-700 dark:text-slate-300">
                     ${scan.metadata?.title || 'Awaiting metadata'}${scan.metadata?.authors ? ` • ${scan.metadata.authors.join(', ')}` : ''}
                 </div>
-                <div class="text-xs text-slate-500">
+                ${scan.order ? `<div class="text-xs text-slate-500 dark:text-slate-400">Order status: ${scan.order.status}</div>` : ''}
+                <div class="text-xs text-slate-500 dark:text-slate-500">
                     ${new Date(scan.scannedAt).toLocaleString()} • Source: ${scan.scanSource}
                 </div>
-                ${scan.notes ? `<div class="text-xs text-amber-300">Note: ${scan.notes}</div>` : ''}
+                ${scan.notes ? `<div class="text-xs text-amber-600 dark:text-amber-300">Note: ${scan.notes}</div>` : ''}
             </div>
             <div class="flex flex-wrap gap-2">
                 ${renderActions(scan)}
@@ -420,16 +433,18 @@ function renderHistory(scans) {
         ui.historyList.appendChild(item);
     });
 
-    ui.pendingBadge.textContent = scans.filter((s) => s.status === 'PENDING_LOOKUP').length;
+    const pendingCount = scans.filter((s) => s.status === 'PENDING_LOOKUP').length;
+    ui.pendingBadge.textContent = pendingCount;
+    updateQueueBadge(pendingCount > 0 ? 'Queued' : 'Idle');
 }
 
 function statusBadge(status) {
     const styles = {
-        PENDING_LOOKUP: 'bg-amber-500/20 text-amber-200 border border-amber-500/40',
-        FOUND: 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/40',
-        INVALID: 'bg-rose-500/20 text-rose-200 border border-rose-500/40',
-        NOT_FOUND: 'bg-sky-500/20 text-sky-200 border border-sky-500/40',
-        ERROR: 'bg-orange-500/20 text-orange-200 border border-orange-500/40',
+        PENDING_LOOKUP: 'bg-amber-500/20 text-amber-700 border border-amber-500/40 dark:text-amber-200',
+        FOUND: 'bg-emerald-500/20 text-emerald-700 border border-emerald-500/40 dark:text-emerald-200',
+        INVALID: 'bg-rose-500/20 text-rose-700 border border-rose-500/40 dark:text-rose-200',
+        NOT_FOUND: 'bg-sky-500/20 text-sky-700 border border-sky-500/40 dark:text-sky-200',
+        ERROR: 'bg-orange-500/20 text-orange-700 border border-orange-500/40 dark:text-orange-200',
     };
     const label =
         status === 'PENDING_LOOKUP'
@@ -437,34 +452,31 @@ function statusBadge(status) {
             : status === 'NOT_FOUND'
               ? 'Not Found'
               : status;
-    return `<span class="px-2 py-1 text-xs rounded-md ${styles[status] || 'bg-slate-600/30 text-slate-200'}">${label}</span>`;
+    return `<span class="px-2 py-1 text-xs rounded-md ${styles[status] || 'bg-slate-200 text-slate-700 dark:bg-slate-600/30 dark:text-slate-200'}">${label}</span>`;
 }
 
 function renderActions(scan) {
     const retryable = ['ERROR', 'NOT_FOUND', 'INVALID'].includes(scan.status);
     const retryBtn = retryable
-        ? `<button data-retry="${scan.id}" class="px-3 py-1 text-xs rounded-md border border-slate-700 bg-slate-800 hover:border-amber-400">Retry</button>`
+        ? `<button data-retry="${scan.id}" class="px-3 py-1 text-xs rounded-md border border-slate-300 bg-white hover:border-amber-400 dark:border-slate-700 dark:bg-slate-800">Retry</button>`
         : '';
     const manualBtn =
         scan.status !== 'FOUND'
-            ? `<button data-manual="${scan.id}" class="px-3 py-1 text-xs rounded-md border border-slate-700 bg-slate-800 hover:border-emerald-400">Add title</button>`
+            ? `<button data-manual="${scan.id}" class="px-3 py-1 text-xs rounded-md border border-slate-300 bg-white hover:border-emerald-400 dark:border-slate-700 dark:bg-slate-800">Add title</button>`
             : '';
+    const detailLink = `<a href="/scan-intents/${scan.id}" class="px-3 py-1 text-xs rounded-md border border-slate-300 bg-white hover:border-slate-500 dark:border-slate-700 dark:bg-slate-800">Details</a>`;
 
-    return `${retryBtn}${manualBtn}`;
+    return `${detailLink}${retryBtn}${manualBtn}`;
 }
 
 async function manualRetry(id) {
-    const scan = state.scansCache.find((item) => item.id === id);
-    if (!scan) return;
-    await upsertScan({
-        ...scan,
-        status: 'PENDING_LOOKUP',
-        notes: scan.notes,
-        lastTriedAt: undefined,
-        tryCount: scan.tryCount || 0,
-    });
-    await refreshHistory();
-    processQueue();
+    try {
+        await apiRequest(`/scan-intents/${id}/retry`, { method: 'POST' });
+        await refreshHistory();
+    } catch (error) {
+        console.error('Unable to retry scan', error);
+        setFeedback('Unable to retry scan.', 'error');
+    }
 }
 
 async function promptManualTitle(id) {
@@ -474,201 +486,21 @@ async function promptManualTitle(id) {
     if (title === null) {
         return;
     }
-    const metadata = {
-        ...(scan.metadata || {}),
-        title: title || 'Untitled entry',
-        manualOverride: true,
-    };
-    await upsertScan({
-        ...scan,
-        metadata,
-        status: scan.status === 'FOUND' ? 'FOUND' : 'NOT_FOUND',
-        notes: scan.notes,
-    });
-    await refreshHistory();
-}
 
-function startJobLoop() {
-    processQueue();
-    setInterval(processQueue, jobIntervalMs);
-}
-
-async function processQueue() {
-    if (state.processingQueue) return;
-    state.processingQueue = true;
-    updateQueueBadge('Processing');
     try {
-        const pending = state.scansCache.filter(isEligibleForLookup).slice(0, jobBatchSize);
-        for (const scan of pending) {
-            await handleLookup(scan);
-        }
-    } finally {
-        state.processingQueue = false;
-        updateQueueBadge('Idle');
+        await apiRequest(`/scan-intents/${id}/manual-title`, {
+            method: 'POST',
+            body: JSON.stringify({ title }),
+        });
         await refreshHistory();
+    } catch (error) {
+        console.error('Unable to save manual title', error);
+        setFeedback('Unable to save manual title.', 'error');
     }
 }
 
 function updateQueueBadge(text) {
     if (ui.queueBadge) {
         ui.queueBadge.textContent = text;
-    }
-}
-
-function isEligibleForLookup(scan) {
-    if (scan.status === 'PENDING_LOOKUP') {
-        return true;
-    }
-    if (scan.status === 'ERROR' && scan.tryCount < maxRetries) {
-        const delay = Math.min(baseBackoffMs * 2 ** scan.tryCount, 30 * 60 * 1000);
-        const nextAllowed = (scan.lastTriedAt || 0) + delay;
-        return Date.now() >= nextAllowed;
-    }
-    return false;
-}
-
-async function handleLookup(scan) {
-    const now = Date.now();
-    const validation = classifyIsbn(scan.isbn);
-    if (validation.status === 'INVALID') {
-        await upsertScan({
-            ...scan,
-            status: 'INVALID',
-            notes: validation.reason,
-            lastTriedAt: now,
-            tryCount: scan.tryCount + 1,
-        });
-        return;
-    }
-
-    const result = await lookupIsbn(validation.normalized);
-    if (result.status === 'FOUND') {
-        await upsertScan({
-            ...scan,
-            status: 'FOUND',
-            metadata: result.metadata,
-            lastTriedAt: now,
-            tryCount: scan.tryCount + 1,
-            notes: undefined,
-        });
-        return;
-    }
-
-    if (result.status === 'NOT_FOUND') {
-        await upsertScan({
-            ...scan,
-            status: 'NOT_FOUND',
-            metadata: null,
-            lastTriedAt: now,
-            tryCount: scan.tryCount + 1,
-            notes: 'No metadata found via lookup.',
-        });
-        return;
-    }
-
-    await upsertScan({
-        ...scan,
-        status: 'ERROR',
-        lastTriedAt: now,
-        tryCount: scan.tryCount + 1,
-        notes: result.message || 'Lookup failed',
-    });
-}
-
-async function lookupIsbn(isbn) {
-    if (state.inFlightLookups.has(isbn)) {
-        return state.inFlightLookups.get(isbn);
-    }
-    const promise = performLookup(isbn).finally(() => state.inFlightLookups.delete(isbn));
-    state.inFlightLookups.set(isbn, promise);
-    return promise;
-}
-
-async function performLookup(isbn) {
-    const openLibrary = await queryOpenLibrary(isbn);
-    if (openLibrary.status === 'FOUND') {
-        return openLibrary;
-    }
-    if (openLibrary.status === 'ERROR' && openLibrary.retryable) {
-        return openLibrary;
-    }
-
-    const google = await queryGoogleBooks(isbn);
-    if (google.status === 'FOUND') {
-        return google;
-    }
-    if (google.status === 'ERROR' && google.retryable) {
-        return google;
-    }
-
-    if (openLibrary.status === 'NOT_FOUND' && google.status === 'NOT_FOUND') {
-        return { status: 'NOT_FOUND' };
-    }
-
-    return { status: 'ERROR', message: openLibrary.message || google.message, retryable: true };
-}
-
-async function queryOpenLibrary(isbn) {
-    try {
-        const response = await fetchWithTimeout(`https://openlibrary.org/isbn/${isbn}.json`, { timeout: 7000 });
-        if (response.status === 404) {
-            return { status: 'NOT_FOUND' };
-        }
-        if (!response.ok) {
-            return { status: 'ERROR', message: 'Open Library error', retryable: response.status >= 500 };
-        }
-        const data = await response.json();
-        const authors = Array.isArray(data.authors)
-            ? data.authors.map((author) => author.name || author.key).filter(Boolean)
-            : [];
-        return {
-            status: 'FOUND',
-            metadata: {
-                title: data.title,
-                authors,
-                source: 'Open Library',
-            },
-        };
-    } catch (error) {
-        return { status: 'ERROR', message: error.message, retryable: true };
-    }
-}
-
-async function queryGoogleBooks(isbn) {
-    try {
-        const response = await fetchWithTimeout(
-            `https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`,
-            { timeout: 7000 }
-        );
-        if (!response.ok) {
-            return { status: 'ERROR', message: 'Google Books error', retryable: response.status >= 500 };
-        }
-        const data = await response.json();
-        if (!data.totalItems) {
-            return { status: 'NOT_FOUND' };
-        }
-        const item = data.items[0]?.volumeInfo;
-        return {
-            status: 'FOUND',
-            metadata: {
-                title: item?.title || 'Unknown title',
-                authors: item?.authors || [],
-                source: 'Google Books',
-            },
-        };
-    } catch (error) {
-        return { status: 'ERROR', message: error.message, retryable: true };
-    }
-}
-
-async function fetchWithTimeout(resource, options = {}) {
-    const { timeout = 8000, ...rest } = options;
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    try {
-        const response = await fetch(resource, { ...rest, signal: controller.signal });
-        return response;
-    } finally {
-        clearTimeout(id);
     }
 }
